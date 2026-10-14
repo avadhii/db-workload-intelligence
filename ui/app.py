@@ -150,24 +150,70 @@ if page == "📊 Overview":
 
 
 # ════════════════════════════════════════════════════════════
-# PAGE: Forecast  (rolling-average baseline — not an ML model)
+# PAGE: Forecast  (LightGBM + rolling-average baseline)
 # ════════════════════════════════════════════════════════════
 elif page == "📈 Forecast":
     import pandas as pd
 
     st.title("📈 Workload Forecast")
     st.caption(
-        "**Baseline forecast** — 4-period (20-min) rolling average of historical QPS. "
-        "This is a naive baseline, **not** a trained ML model."
+        "**ML-powered forecast** using LightGBM quantile regression with confidence intervals, "
+        "alongside a transparent rolling-average baseline for comparison."
     )
 
-    hours = st.selectbox(
-        "Historical window",
-        [6, 12, 24, 48],
-        index=2,
-        format_func=lambda h: f"Last {h} hours",
-    )
+    col_f1, col_f2 = st.columns([3, 1])
+    with col_f2:
+        hours = st.selectbox(
+            "Historical window",
+            [6, 12, 24, 48],
+            index=2,
+            format_func=lambda h: f"Last {h} hours",
+        )
 
+    # ── Model management ─────────────────────────────────────────────
+    st.subheader("🧠 LightGBM Forecast Model")
+
+    model_status = api_get("/forecast/model-status")
+    if model_status and model_status.get("trained"):
+        st.success(
+            f"✅ Model trained at {model_status.get('trained_at', 'N/A')} | "
+            f"Rows: {model_status.get('training_rows', 'N/A')} | "
+            f"Val sMAPE: {model_status.get('validation_smape', 'N/A')}%"
+        )
+    else:
+        st.warning("⚠️ LightGBM model not trained. Click below to train on historical data.")
+
+    t_col1, t_col2 = st.columns([1, 3])
+    with t_col1:
+        train_hours = st.selectbox("Training window", [24, 48, 72, 168], index=1,
+                                    format_func=lambda h: f"{h} hours")
+    with t_col2:
+        if st.button("🚀 Train LightGBM Model", type="primary"):
+            with st.spinner("Training LightGBM quantile regression model..."):
+                result = api_post("/forecast/train", {
+                    "metric": "db.qps",
+                    "hours": train_hours,
+                    "bucket_minutes": 5,
+                })
+                if result:
+                    st.success(f"✅ {result.get('message', 'Model trained!')}")
+                    st.rerun()
+
+    st.markdown("---")
+
+    # ── Forecast display ─────────────────────────────────────────────
+    st.subheader("📊 QPS Forecast")
+
+    horizon = st.slider("Forecast horizon (steps × 5 min)", 6, 48, 12)
+
+    forecast_data = api_get("/forecast/", {
+        "metric": "db.qps",
+        "hours": hours,
+        "horizon": horizon,
+        "bucket_minutes": 5,
+    })
+
+    # Also fetch raw timeseries for plotting actuals
     ts_data = api_get("/metrics/timeseries", {"metric": "db.qps", "hours": hours, "bucket_minutes": 5})
 
     if ts_data and ts_data.get("points"):
@@ -176,48 +222,173 @@ elif page == "📈 Forecast":
         df = df.set_index("bucket").sort_index()
 
         if len(df) < 2:
-            st.warning("Fewer than 2 data points — cannot compute a rolling forecast. Wait for more metric data.")
+            st.warning("Fewer than 2 data points — cannot compute a forecast.")
         else:
-            # 4-period (20 min) rolling-average baseline shifted by 1 to act as a forecast
-            df["Actual QPS"]           = df["avg_val"]
-            df["Forecast (rolling avg)"] = df["avg_val"].rolling(window=4, min_periods=1).mean().shift(1)
+            # Rolling-average baseline
+            df["Actual QPS"] = df["avg_val"]
+            df["Baseline (rolling avg)"] = df["avg_val"].rolling(window=4, min_periods=1).mean().shift(1)
 
-            st.subheader("QPS: Actual vs Baseline Forecast")
-            st.line_chart(df[["Actual QPS", "Forecast (rolling avg)"]], use_container_width=True)
+            chart_df = df[["Actual QPS", "Baseline (rolling avg)"]].copy()
 
-            last_actual   = float(df["Actual QPS"].dropna().iloc[-1])
-            last_forecast = float(df["Forecast (rolling avg)"].dropna().iloc[-1]) if df["Forecast (rolling avg)"].dropna().shape[0] > 0 else 0.0
+            # Add LightGBM forecast if available
+            if forecast_data and forecast_data.get("lightgbm_forecast"):
+                lgbm_points = forecast_data["lightgbm_forecast"]
+                lgbm_df = pd.DataFrame(lgbm_points)
+                lgbm_df["ts"] = pd.to_datetime(lgbm_df["ts"])
+                lgbm_df = lgbm_df.set_index("ts")
+                chart_df = chart_df.join(
+                    lgbm_df[["predicted", "lower", "upper"]].rename(columns={
+                        "predicted": "LightGBM Forecast",
+                        "lower": "LightGBM Lower (10%)",
+                        "upper": "LightGBM Upper (90%)",
+                    }),
+                    how="outer",
+                )
 
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Last Actual QPS",      f"{last_actual:.2f}")
-            c2.metric("Baseline Forecast QPS", f"{last_forecast:.2f}")
-            c3.metric("Historical Data Points", len(df))
+            # Add baseline forecast points
+            if forecast_data and forecast_data.get("baseline_forecast"):
+                bl_points = forecast_data["baseline_forecast"]
+                bl_df = pd.DataFrame(bl_points)
+                bl_df["ts"] = pd.to_datetime(bl_df["ts"])
+                bl_df = bl_df.set_index("ts")
+                chart_df = chart_df.join(
+                    bl_df[["predicted"]].rename(columns={"predicted": "Baseline Forecast"}),
+                    how="outer",
+                )
 
-            with st.expander("ℹ️ How this forecast works"):
+            st.line_chart(chart_df, use_container_width=True)
+
+            # Metrics
+            last_actual = float(df["Actual QPS"].dropna().iloc[-1])
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Last Actual QPS", f"{last_actual:.2f}")
+
+            if forecast_data and forecast_data.get("lightgbm_forecast"):
+                lgbm_next = forecast_data["lightgbm_forecast"][0]
+                c2.metric("LightGBM Next Step", f"{lgbm_next['predicted']:.2f}")
+                c3.metric("Confidence Band",
+                          f"[{lgbm_next['lower']:.1f}, {lgbm_next['upper']:.1f}]")
+            else:
+                c2.metric("LightGBM", "Not trained")
+                c3.metric("Confidence Band", "N/A")
+
+            c4.metric("Data Points", len(df))
+
+            with st.expander("ℹ️ About the forecast models"):
                 st.markdown(
-                    "Each forecast point is the **mean of the previous 4 observed QPS buckets** (each bucket = 5 min). "
-                    "The forecast is shifted by one period so it represents a look-ahead prediction. "
-                    "No LightGBM, ARIMA, or other statistical model is used — this is a transparent naive baseline."
+                    "**LightGBM Quantile Regression** trains three models (10th, 50th, 90th percentiles) "
+                    "on lag features, rolling statistics, and calendar features to produce probabilistic "
+                    "forecasts with confidence intervals.\n\n"
+                    "**Baseline (rolling avg)** is a 4-period moving average — a transparent naive baseline.\n\n"
+                    "Train the model via the button above or `POST /forecast/train`."
                 )
     else:
         st.info(
-            "No QPS metric data found in the last "
-            f"{hours} hours. Ensure the collector and load generator are running."
+            f"No QPS metric data found in the last {hours} hours. "
+            "Ensure the collector and load generator are running."
         )
 
 
 # ════════════════════════════════════════════════════════════
-# PAGE: Anomalies & Causes  (with RCA baseline)
+# PAGE: Anomalies & Causes  (Isolation Forest + RCA)
 # ════════════════════════════════════════════════════════════
 elif page == "🚨 Anomalies & Causes":
-    st.title("🚨 Anomalies & Root Causes")
+    import pandas as pd
 
-    hours = st.slider("Look-back window (hours)", 1, 168, 24)
+    st.title("🚨 Anomalies & Root Causes")
+    st.caption(
+        "**ML-powered anomaly detection** using Isolation Forest on multivariate database metrics, "
+        "combined with rule-based Root Cause Analysis."
+    )
+
+    # ── ML Anomaly Detection Section ─────────────────────────────────
+    st.subheader("🤖 Isolation Forest Anomaly Detection")
+
+    anom_model_status = api_get("/anomalies/model-status")
+    if anom_model_status and anom_model_status.get("trained"):
+        st.success(
+            f"✅ Model trained at {anom_model_status.get('trained_at', 'N/A')} | "
+            f"Samples: {anom_model_status.get('samples_used', 'N/A')} | "
+            f"Contamination: {anom_model_status.get('contamination', 'N/A')}"
+        )
+    else:
+        st.warning("⚠️ Isolation Forest model not trained. Train it below or it will run ad-hoc.")
+
+    at_col1, at_col2 = st.columns([1, 3])
+    with at_col1:
+        anom_train_hours = st.selectbox("Training data", [24, 48, 72, 168], index=1,
+                                         format_func=lambda h: f"{h}h", key="anom_train_hrs")
+    with at_col2:
+        if st.button("🚀 Train Isolation Forest", type="primary"):
+            with st.spinner("Training Isolation Forest on multivariate metrics..."):
+                result = api_post("/anomalies/train", {
+                    "hours": anom_train_hours,
+                    "bucket_minutes": 5,
+                    "contamination": 0.05,
+                })
+                if result:
+                    st.success(f"✅ {result.get('message', 'Model trained!')}")
+                    st.rerun()
+
+    st.markdown("---")
+
+    # ── Run Detection ────────────────────────────────────────────────
+    detect_col1, detect_col2 = st.columns([2, 1])
+    with detect_col1:
+        detect_hours = st.slider("Detection window (hours)", 1, 48, 6, key="detect_hrs")
+    with detect_col2:
+        record_to_db = st.checkbox("Log to incidents table", value=False, help="Persist detected anomalies to the database incident log")
+
+    if st.button("🔍 Run Anomaly Detection", type="primary"):
+        with st.spinner("Running Isolation Forest anomaly detection..."):
+            detect_result = api_get("/anomalies/detect", {
+                "hours": detect_hours,
+                "bucket_minutes": 5,
+                "contamination": 0.05,
+                "record": record_to_db,
+            })
+            if detect_result:
+                st.session_state["ml_anomaly_result"] = detect_result
+
+    ml_result = st.session_state.get("ml_anomaly_result")
+    if ml_result:
+        anomaly_count = ml_result.get("anomaly_count", 0)
+        total_points = ml_result.get("total_points", 0)
+        recorded = ml_result.get("recorded_to_incidents", 0)
+
+        if anomaly_count > 0:
+            st.error(f"🚨 Detected **{anomaly_count}** anomalous data points out of {total_points} total.")
+            if recorded > 0:
+                st.info(f"💾 Persisted **{recorded}** new anomaly incident(s) to the incidents table below.")
+            anom_list = ml_result.get("anomalies", [])
+            anom_df = pd.DataFrame(anom_list)
+            if not anom_df.empty:
+                display_cols = ["ts", "score", "method"]
+                # Expand metrics dict into columns
+                if "metrics" in anom_df.columns:
+                    metrics_expanded = pd.json_normalize(anom_df["metrics"])
+                    anom_display = pd.concat([anom_df[display_cols].reset_index(drop=True),
+                                               metrics_expanded.reset_index(drop=True)], axis=1)
+                else:
+                    anom_display = anom_df[display_cols]
+                st.dataframe(anom_display, use_container_width=True)
+        else:
+            st.success(f"✅ No anomalies detected in the last {detect_hours} hours ({total_points} points analyzed).")
+
+        st.caption(
+            f"Model source: {ml_result.get('model_source', 'N/A')} | "
+            f"Features: {', '.join(ml_result.get('feature_columns', []))}"
+        )
+
+    st.markdown("---")
+
+    # ── Recorded Incidents + RCA (existing) ──────────────────────────
+    st.subheader("📋 Recorded Incidents")
+
+    hours = st.slider("Look-back window (hours)", 1, 168, 24, key="incident_hrs")
     data = api_get("/anomalies/", {"hours": hours})
 
     if data and data.get("anomalies"):
-        import pandas as pd
-
         incidents = data["anomalies"]
         df = pd.DataFrame(incidents)
         st.success(f"Found **{len(df)}** recorded incidents in the last {hours} hours.")

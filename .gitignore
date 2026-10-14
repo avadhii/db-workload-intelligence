@@ -48,3 +48,4 @@ htmlcov/
 *.log
 *.pid
 *.seed
+models_cache/

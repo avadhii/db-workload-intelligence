@@ -6,6 +6,7 @@ Baselines: seasonal-naive, ETS.
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -86,6 +87,7 @@ class LightGBMForecaster:
                 "feature_fraction": 0.8,
                 "bagging_fraction": 0.8,
                 "bagging_freq": 5,
+                "min_data_in_leaf": max(2, min(20, len(X_train) // 5)),
                 "verbose": -1,
             }
             train_ds = lgb.Dataset(X_train, label=y_train)
@@ -99,6 +101,44 @@ class LightGBMForecaster:
             )
             logger.info("Trained quantile=%.2f model", q)
 
+    def save(self, directory: str) -> None:
+        """Save forecaster models and hyperparameters to directory."""
+        import json
+        import os
+        os.makedirs(directory, exist_ok=True)
+        meta = {
+            "quantiles": list(self.quantiles),
+            "num_boost_round": self.num_boost_round,
+            "early_stopping_rounds": self.early_stopping_rounds,
+        }
+        with open(os.path.join(directory, "meta.json"), "w") as f:
+            json.dump(meta, f)
+        for q, model in self.models.items():
+            model.save_model(os.path.join(directory, f"model_q{int(q*100)}.txt"))
+
+    @classmethod
+    def load(cls, directory: str) -> LightGBMForecaster:
+        """Load forecaster models and hyperparameters from directory."""
+        import json
+        import os
+        if not HAS_LIGHTGBM:
+            raise ImportError("lightgbm is required for this model")
+        meta_path = os.path.join(directory, "meta.json")
+        if not os.path.exists(meta_path):
+            raise FileNotFoundError(f"Missing meta.json in {directory}")
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        forecaster = cls(
+            quantiles=tuple(meta["quantiles"]),
+            num_boost_round=meta["num_boost_round"],
+            early_stopping_rounds=meta["early_stopping_rounds"],
+        )
+        for q in forecaster.quantiles:
+            m_path = os.path.join(directory, f"model_q{int(q*100)}.txt")
+            if os.path.exists(m_path):
+                forecaster.models[q] = lgb.Booster(model_file=m_path)
+        return forecaster
+
     def predict(self, X: pd.DataFrame) -> ForecastResult:
         if not self.models:
             raise RuntimeError("Model not trained. Call fit() first.")
@@ -109,6 +149,79 @@ class LightGBMForecaster:
 
         return ForecastResult(
             horizon_steps=len(X),
+            predictions=preds_50,
+            lower_bound=preds_lo,
+            upper_bound=preds_hi,
+            model_name="lightgbm_quantile",
+        )
+
+    def predict_future(
+        self,
+        df: pd.DataFrame,
+        target_col: str = "avg_val",
+        ts_col: str = "bucket",
+        horizon: int = 12,
+        freq_minutes: int = 5,
+    ) -> ForecastResult:
+        """
+        Produce multi-step future forecasts autoregressively.
+        Uses the median (0.5) quantile model for recursive lag feedback,
+        and 0.1 and 0.9 quantile models for confidence intervals.
+        """
+        if not self.models:
+            raise RuntimeError("Model not trained. Call fit() first.")
+
+        from ml.features import make_feature_matrix
+
+        if df.empty:
+            return ForecastResult(
+                horizon_steps=0,
+                predictions=[],
+                lower_bound=[],
+                upper_bound=[],
+                model_name="lightgbm_quantile",
+            )
+
+        extended_df = df[[ts_col, target_col]].copy().sort_values(ts_col).reset_index(drop=True)
+        preds_50: list[float] = []
+        preds_lo: list[float] = []
+        preds_hi: list[float] = []
+
+        last_ts = extended_df[ts_col].iloc[-1]
+        step_delta = timedelta(minutes=freq_minutes)
+
+        for step in range(horizon):
+            next_ts = last_ts + step_delta * (step + 1)
+            # Placeholder for target value to allow lag feature calculation
+            last_known = preds_50[-1] if preds_50 else extended_df[target_col].iloc[-1]
+            temp_row = pd.DataFrame([{ts_col: next_ts, target_col: last_known}])
+            curr_df = pd.concat([extended_df, temp_row], ignore_index=True)
+
+            X_curr, _ = make_feature_matrix(curr_df, target_col, ts_col)
+            if X_curr.empty:
+                break
+
+            latest_X = X_curr.iloc[[-1]]
+            p50 = float(self.models[0.5].predict(latest_X)[0])
+            plo = float(self.models[0.1].predict(latest_X)[0])
+            phi = float(self.models[0.9].predict(latest_X)[0])
+
+            # Non-negative clamping if target history is non-negative
+            if (df[target_col] >= 0).all():
+                p50 = max(0.0, p50)
+                plo = max(0.0, min(plo, p50))
+                phi = max(p50, phi)
+
+            preds_50.append(round(p50, 4))
+            preds_lo.append(round(plo, 4))
+            preds_hi.append(round(phi, 4))
+
+            # Append the actual prediction to extended_df
+            new_row = pd.DataFrame([{ts_col: next_ts, target_col: p50}])
+            extended_df = pd.concat([extended_df, new_row], ignore_index=True)
+
+        return ForecastResult(
+            horizon_steps=len(preds_50),
             predictions=preds_50,
             lower_bound=preds_lo,
             upper_bound=preds_hi,

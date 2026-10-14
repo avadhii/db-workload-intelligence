@@ -123,7 +123,7 @@ def detect_isolation_forest(
     Method C: Isolation Forest on multivariate metric vector.
     df columns should be the metric columns to consider jointly.
     """
-    X = df.fillna(df.median()).values
+    X = df.fillna(df.median()).fillna(0.0).values
     clf = IsolationForest(contamination=contamination, random_state=42)
     labels = clf.fit_predict(X)   # -1 = anomaly, 1 = normal
     scores = clf.score_samples(X)
@@ -131,15 +131,119 @@ def detect_isolation_forest(
     anomalies = []
     for i, (label, score, ts) in enumerate(zip(labels, scores, timestamps)):
         if label == -1:
+            row_metrics = {
+                col: round(float(df[col].iloc[i]), 4)
+                for col in df.columns
+            }
             anomalies.append(AnomalyScore(
                 ts=ts, metric="multivariate",
                 value=float(score),
                 score=float(-score / max(abs(scores.min()), 1e-9)),
                 method="isolation_forest", is_anomaly=True,
-                context={"raw_score": float(score)},
+                context={"raw_score": float(score), "metrics": row_metrics},
             ))
 
     return anomalies
+
+
+class IsolationForestDetector:
+    """
+    Production-grade Isolation Forest detector for database metric vectors.
+    Provides fit() and detect() methods similar to LightGBMForecaster.
+    """
+
+    def __init__(
+        self,
+        contamination: float = 0.05,
+        n_estimators: int = 150,
+        random_state: int = 42,
+    ):
+        self.contamination = contamination
+        self.n_estimators = n_estimators
+        self.random_state = random_state
+        self.model: Optional[IsolationForest] = None
+        self.feature_cols: list[str] = []
+
+    def fit(self, df: pd.DataFrame, feature_cols: Optional[list[str]] = None) -> dict:
+        """Fit Isolation Forest on metric columns."""
+        self.feature_cols = feature_cols or list(df.columns)
+        X = df[self.feature_cols].fillna(df[self.feature_cols].median()).fillna(0.0)
+        self.model = IsolationForest(
+            contamination=self.contamination,
+            n_estimators=self.n_estimators,
+            random_state=self.random_state,
+        )
+        self.model.fit(X.values)
+        logger.info(
+            "IsolationForestDetector trained on %d samples with %d features",
+            len(X), len(self.feature_cols),
+        )
+        return {
+            "samples_used": len(X),
+            "contamination": self.contamination,
+            "features": self.feature_cols,
+        }
+
+    def save(self, filepath: str) -> None:
+        """Save isolation forest detector to disk using joblib."""
+        import os
+        import joblib
+        os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+        joblib.dump({
+            "contamination": self.contamination,
+            "n_estimators": self.n_estimators,
+            "random_state": self.random_state,
+            "feature_cols": self.feature_cols,
+            "model": self.model,
+        }, filepath)
+
+    @classmethod
+    def load(cls, filepath: str) -> IsolationForestDetector:
+        """Load isolation forest detector from disk."""
+        import joblib
+        data = joblib.load(filepath)
+        detector = cls(
+            contamination=data["contamination"],
+            n_estimators=data["n_estimators"],
+            random_state=data["random_state"],
+        )
+        detector.feature_cols = data["feature_cols"]
+        detector.model = data["model"]
+        return detector
+
+    def detect(self, df: pd.DataFrame, timestamps: pd.Series) -> list[AnomalyScore]:
+        """Detect anomalies using fitted model."""
+        if self.model is None:
+            raise RuntimeError("Model not trained. Call fit() first.")
+
+        df_copy = df.copy()
+        for col in self.feature_cols:
+            if col not in df_copy.columns:
+                df_copy[col] = 1.0 if "cache_hit" in col else 0.0
+
+        X = df_copy[self.feature_cols].fillna(df_copy[self.feature_cols].median()).fillna(0.0)
+        labels = self.model.predict(X.values)
+        scores = self.model.decision_function(X.values)
+
+        anomalies = []
+        for i, (label, score, ts) in enumerate(zip(labels, scores, timestamps)):
+            if label == -1:
+                row_metrics = {
+                    col: round(float(X[col].iloc[i]), 4)
+                    for col in self.feature_cols
+                }
+                # Normalized severity: higher is more anomalous (0 to 1)
+                normalized_score = round(min(1.0, max(0.0, float(-score) * 4)), 4)
+                anomalies.append(AnomalyScore(
+                    ts=ts,
+                    metric="multivariate",
+                    value=float(score),
+                    score=normalized_score,
+                    method="isolation_forest",
+                    is_anomaly=True,
+                    context={"raw_score": float(score), "metrics": row_metrics},
+                ))
+        return anomalies
 
 
 def merge_and_deduplicate(
